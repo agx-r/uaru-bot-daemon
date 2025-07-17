@@ -1,3 +1,4 @@
+*.log
 zig-out/
 zig-cache/
 .zig-cache/
@@ -20,4 +21,3 @@ tmp/
 *.tmp
 kernel
 token.txt
-bot.log
