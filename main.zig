@@ -58,27 +58,25 @@ fn callCoreBinary(allocator: std.mem.Allocator, message: types.TelegramUpdate.Me
 
         const parsed = json.parseFromSlice(types.CoreResponse, arena_allocator, stdout.items, .{}) catch |err| {
             if (err == error.UnexpectedToken) {
-                return; // Treat UnexpectedToken as non-error (feature)
+                return;
             }
             return err;
         };
         defer parsed.deinit();
 
-        // Print log with color based on level
         if (parsed.value.log) |log| {
             const stderr_writer = std.io.getStdErr().writer();
             const color = if (std.mem.eql(u8, log.level, "info"))
-                "\x1b[32m" // Green for info
+                "\x1b[32m"
             else if (std.mem.eql(u8, log.level, "debug"))
-                "\x1b[34m" // Blue for debug
+                "\x1b[34m"
             else if (std.mem.eql(u8, log.level, "error"))
-                "\x1b[31m" // Red for error
+                "\x1b[31m"
             else
-                "\x1b[33m"; // Yellow for others
+                "\x1b[33m";
             try stderr_writer.print("{s}{s}\x1b[0m\n", .{color, log.msg});
         }
 
-        // Handle actions
         if (parsed.value.actions) |actions| {
             if (actions.sendMessage) |send_msg| {
                 try telegram.sendMessage(allocator, try utils.readBotToken(allocator), chat.id, send_msg.text, send_msg.replyToId);
