@@ -18,4 +18,5 @@ bin/
 test-results/
 tmp/
 *.tmp
+kernel
 token.txt

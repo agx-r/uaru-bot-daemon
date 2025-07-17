@@ -38,45 +38,84 @@ pub const TelegramUpdate = struct {
     };
 };
 
+pub const CoreResponse = struct {
+    status: []const u8,
+    log: ?Log = null,
+    actions: Actions,
+
+    pub const Log = struct {
+        msg: []const u8,
+        level: []const u8,
+    };
+
+    pub const Actions = struct {
+        sendMessage: ?SendMessage = null,
+        unmuteUser: ?[]const u8 = null,
+        pinMessage: ?[]const u8 = null,
+        muteUser: ?[]const u8 = null,
+        deleteMessage: ?[]const u8 = null,
+        banUser: ?[]const u8 = null,
+
+        pub const SendMessage = struct {
+            text: []const u8,
+            replyToId: ?i64 = null,
+        };
+    };
+};
+
 pub fn parseUpdates(allocator: std.mem.Allocator, json_str: []const u8) ![]TelegramUpdate {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
+    const arena_allocator = arena.allocator();
 
-    const parsed = try json.parseFromSlice(json.Value, arena.allocator(), json_str, .{});
+    const parsed = try json.parseFromSlice(json.Value, arena_allocator, json_str, .{});
     defer parsed.deinit();
 
-    const results = parsed.value.object.get("result").?.array;
-    var updates = try std.ArrayList(TelegramUpdate).initCapacity(allocator, results.items.len);
-    errdefer updates.deinit();
+    const results = parsed.value.object.get("result") orelse return error.InvalidJson;
+    const result_array = results.array;
 
-    for (results.items) |result| {
-        try updates.append(try parseSingleUpdate(result));
+    var updates = try std.ArrayList(TelegramUpdate).initCapacity(allocator, result_array.items.len);
+    defer updates.deinit();
+
+    for (result_array.items) |result| {
+        try updates.append(try parseSingleUpdate(arena_allocator, result));
     }
 
     return updates.toOwnedSlice();
 }
 
-
-fn parseSingleUpdate(update_value: json.Value) !TelegramUpdate {
+fn parseSingleUpdate(allocator: std.mem.Allocator, update_value: json.Value) !TelegramUpdate {
     const obj = update_value.object;
+    const update_id_val = obj.get("update_id") orelse return error.InvalidJsonUpdateId;
+    if (update_id_val != .integer) return error.InvalidJsonUpdateId;
+
     var update = TelegramUpdate{
-        .update_id = obj.get("update_id").?.integer,
+        .update_id = update_id_val.integer,
     };
 
     if (obj.get("message")) |message_val| {
         const msg_obj = message_val.object;
+        const message_id_val = msg_obj.get("message_id") orelse return error.InvalidJsonMessageId;
+        const date_val = msg_obj.get("date") orelse return error.InvalidJsonDate;
+        if (message_id_val != .integer or date_val != .integer) return error.InvalidJsonType;
+
         var message = TelegramUpdate.Message{
-            .message_id = msg_obj.get("message_id").?.integer,
-            .date = msg_obj.get("date").?.integer,
+            .message_id = message_id_val.integer,
+            .date = date_val.integer,
             .text = if (msg_obj.get("text")) |t| t.string else null,
         };
 
         if (msg_obj.get("from")) |from_val| {
             const from_obj = from_val.object;
+            const id_val = from_obj.get("id") orelse return error.InvalidJsonUserId;
+            const is_bot_val = from_obj.get("is_bot") orelse return error.InvalidJsonIsBot;
+            const first_name_val = from_obj.get("first_name") orelse return error.InvalidJsonFirstName;
+            if (id_val != .integer or is_bot_val != .bool or first_name_val != .string) return error.InvalidJsonType;
+
             message.from = .{
-                .id = from_obj.get("id").?.integer,
-                .is_bot = from_obj.get("is_bot").?.bool,
-                .first_name = from_obj.get("first_name").?.string,
+                .id = id_val.integer,
+                .is_bot = is_bot_val.bool,
+                .first_name = first_name_val.string,
                 .username = if (from_obj.get("username")) |u| u.string else null,
                 .language_code = if (from_obj.get("language_code")) |l| l.string else null,
             };
@@ -84,25 +123,33 @@ fn parseSingleUpdate(update_value: json.Value) !TelegramUpdate {
 
         if (msg_obj.get("chat")) |chat_val| {
             const chat_obj = chat_val.object;
+            const id_val = chat_obj.get("id") orelse return error.InvalidJsonChatId;
+            const type_val = chat_obj.get("type") orelse return error.InvalidJsonChatType;
+            if (id_val != .integer or type_val != .string) return error.InvalidJsonType;
+
             message.chat = .{
-                .id = chat_obj.get("id").?.integer,
+                .id = id_val.integer,
                 .first_name = if (chat_obj.get("first_name")) |f| f.string else null,
                 .username = if (chat_obj.get("username")) |u| u.string else null,
-                .type = chat_obj.get("type").?.string,
+                .type = type_val.string,
             };
         }
 
         if (msg_obj.get("entities")) |entities_val| {
             const entities_arr = entities_val.array;
-            var entities = try std.ArrayList(TelegramUpdate.Message.MessageEntity).initCapacity(std.heap.page_allocator, entities_arr.items.len);
-            defer entities.deinit();
+            var entities = try std.ArrayList(TelegramUpdate.Message.MessageEntity).initCapacity(allocator, entities_arr.items.len);
 
             for (entities_arr.items) |entity_val| {
                 const entity_obj = entity_val.object;
+                const offset_val = entity_obj.get("offset") orelse return error.InvalidJsonOffset;
+                const length_val = entity_obj.get("length") orelse return error.InvalidJsonLength;
+                const type_val = entity_obj.get("type") orelse return error.InvalidJsonEntityType;
+                if (offset_val != .integer or length_val != .integer or type_val != .string) return error.InvalidJsonType;
+
                 entities.appendAssumeCapacity(.{
-                    .offset = entity_obj.get("offset").?.integer,
-                    .length = entity_obj.get("length").?.integer,
-                    .type = entity_obj.get("type").?.string,
+                    .offset = offset_val.integer,
+                    .length = length_val.integer,
+                    .type = type_val.string,
                 });
             }
 
@@ -119,9 +166,7 @@ pub fn readFileAsString(allocator: std.mem.Allocator, file_path: []const u8) ![]
     const file = try std.fs.cwd().openFile(file_path, .{});
     defer file.close();
 
-    const content = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
-    
-    return content;
+    return try file.readToEndAlloc(allocator, std.math.maxInt(usize));
 }
 
 fn readExactBytes(file_path: []const u8, buffer: []u8) !void {
@@ -134,9 +179,7 @@ fn readExactBytes(file_path: []const u8, buffer: []u8) !void {
     }
 }
 
-fn curlRequest(request: []const u8) ![]const u8 {
-    const allocator = std.heap.page_allocator;
-    
+fn curlRequest(allocator: std.mem.Allocator, request: []const u8) ![]const u8 {
     const curl_args = [_][]const u8{
         "curl",
         "-s",
@@ -149,27 +192,21 @@ fn curlRequest(request: []const u8) ![]const u8 {
     
     try child.spawn();
 
-    const stdout = try child.stdout.?.reader().readAllAlloc(allocator, std.math.maxInt(usize));
-    errdefer allocator.free(stdout);
+    var stdout = std.ArrayList(u8).init(allocator);
+    defer stdout.deinit();
+    var stderr = std.ArrayList(u8).init(allocator);
+    defer stderr.deinit();
 
-    const stderr = try child.stderr.?.reader().readAllAlloc(allocator, std.math.maxInt(usize));
-    defer allocator.free(stderr);
+    try child.stdout.?.reader().readAllArrayList(&stdout, std.math.maxInt(usize));
+    try child.stderr.?.reader().readAllArrayList(&stderr, std.math.maxInt(usize));
 
     const term = try child.wait();
     if (term != .Exited or term.Exited != 0) {
-        std.debug.print("curl failed ({}): {s}\n", .{term, stderr});
+        std.debug.print("curl failed ({}): {s}\n", .{term, stderr.items});
         return error.CurlFailed;
     }
 
-    // Удаляем завершающие нулевые байты и whitespace
-    const trimmed = std.mem.trim(u8, stdout, &std.ascii.whitespace ++ [_]u8{0});
-    if (trimmed.len != stdout.len) {
-        const cleaned = try allocator.dupe(u8, trimmed);
-        allocator.free(stdout);
-        return cleaned;
-    }
-
-    return stdout;
+    return stdout.toOwnedSlice();
 }
 
 fn verifyFileSize(file_path: []const u8, expected_size: usize) !void {
@@ -182,17 +219,25 @@ fn verifyFileSize(file_path: []const u8, expected_size: usize) !void {
     }
 }
 
-fn getPollingOffset(token: []const u8) !i64 {
-    const full_url = try std.fmt.allocPrint(std.heap.page_allocator, "{s}{s}/getUpdates?offset=0", .{telegram_api_url, token});
-    defer std.heap.page_allocator.free(full_url);
-    const answer_json = try curlRequest(full_url);
-    std.debug.print("Polling offset request := {s}\n", .{full_url});
-    std.debug.print("Polling offset response := {s}\n", .{answer_json});
-    
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+fn getUpdates(allocator: std.mem.Allocator, bot_token: []const u8, offset: i64) ![]TelegramUpdate {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
 
+    const full_url = try std.fmt.allocPrint(arena_allocator, "{s}{s}/getUpdates?offset={}", .{telegram_api_url, bot_token, offset});
+    const answer_json = try curlRequest(arena_allocator, full_url);
+    
+    return try parseUpdates(allocator, answer_json);
+}
+
+fn getPollingOffset(allocator: std.mem.Allocator, bot_token: []const u8) !i64 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const full_url = try std.fmt.allocPrint(arena_allocator, "{s}{s}/getUpdates?offset=0", .{telegram_api_url, bot_token});
+    const answer_json = try curlRequest(arena_allocator, full_url);
+    
     const updates = try parseUpdates(allocator, answer_json);
     defer allocator.free(updates);
 
@@ -203,14 +248,12 @@ fn getPollingOffset(token: []const u8) !i64 {
     return updates[updates.len - 1].update_id;
 }
 
-fn readBotToken() ![45]u8 {
+fn readBotToken(allocator: std.mem.Allocator) ![]const u8 {
     const file_path = "token.txt";
     try verifyFileSize(file_path, 45);
-
-    var buffer: [45]u8 = undefined;
-    try readExactBytes(file_path, &buffer);
-    return buffer;
+    return try readFileAsString(allocator, file_path);
 }
+
 fn handleTokenError(err: anyerror) void {
     switch (err) {
         error.FileNotFound => std.debug.print("token.txt not found\n", .{}),
@@ -221,18 +264,141 @@ fn handleTokenError(err: anyerror) void {
     }
 }
 
-pub fn main() !void {
-    std.debug.print("{s}\n", .{"Started"});
+fn sendMessage(allocator: std.mem.Allocator, bot_token: []const u8, chat_id: i64, text: []const u8, reply_to_id: ?i64) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
 
-    const bot_token = readBotToken() catch |err| {
+    const url = if (reply_to_id) |reply_id|
+        try std.fmt.allocPrint(arena_allocator, "{s}{s}/sendMessage?chat_id={}&text={s}&reply_to_message_id={}", .{telegram_api_url, bot_token, chat_id, text, reply_id})
+    else
+        try std.fmt.allocPrint(arena_allocator, "{s}{s}/sendMessage?chat_id={}&text={s}", .{telegram_api_url, bot_token, chat_id, text});
+
+    const response = try curlRequest(arena_allocator, url);
+    defer arena_allocator.free(response);
+
+    const parsed = try json.parseFromSlice(json.Value, arena_allocator, response, .{});
+    defer parsed.deinit();
+
+    const ok = parsed.value.object.get("ok") orelse return error.InvalidTelegramResponse;
+    if (!ok.bool) {
+        std.debug.print("Telegram API error: {s}\n", .{response});
+        return error.TelegramApiError;
+    }
+}
+
+fn callCoreBinary(allocator: std.mem.Allocator, message: TelegramUpdate.Message) !void {
+    const pwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(pwd);
+    const core_path = try std.fs.path.join(allocator, &[_][]const u8{ pwd, "kernel" });
+    defer allocator.free(core_path);
+
+    const from = message.from orelse return;
+    const chat = message.chat orelse return;
+    const json_arg = try std.json.stringifyAlloc(allocator, .{
+        .event = "messageSent",
+        .message = .{
+            .text = message.text orelse "",
+            .messageId = message.message_id,
+            .replyToMessage = null,
+            .isImage = false,
+            .isFile = false,
+            .isSticker = false,
+            .fromUser = .{
+                .userId = from.id,
+                .firstName = from.first_name,
+                .username = from.username orelse "",
+            },
+        },
+    }, .{ .whitespace = .indent_2 });
+    defer allocator.free(json_arg);
+
+    var child = std.process.Child.init(&[_][]const u8{ core_path, json_arg }, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    try child.spawn();
+
+    var stdout = std.ArrayList(u8).init(allocator);
+    defer stdout.deinit();
+    var stderr = std.ArrayList(u8).init(allocator);
+    defer stderr.deinit();
+
+    try child.stdout.?.reader().readAllArrayList(&stdout, std.math.maxInt(usize));
+    try child.stderr.?.reader().readAllArrayList(&stderr, std.math.maxInt(usize));
+
+    const term = try child.wait();
+    if (term != .Exited or term.Exited != 0) {
+        std.debug.print("core binary failed ({}): {s}\n", .{term, stderr.items});
+        return error.CoreBinaryFailed;
+    }
+
+    if (stdout.items.len > 0) {
+        std.debug.print("Core binary output: {s}\n", .{stdout.items});
+
+        // Parse core binary output
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const arena_allocator = arena.allocator();
+
+        const parsed = try json.parseFromSlice(CoreResponse, arena_allocator, stdout.items, .{});
+        defer parsed.deinit();
+
+        // Handle actions
+        if (parsed.value.actions.sendMessage) |send_msg| {
+            try sendMessage(allocator, try readBotToken(allocator), chat.id, send_msg.text, send_msg.replyToId);
+        }
+    }
+    if (stderr.items.len > 0) {
+        std.debug.print("Core binary stderr: {s}\n", .{stderr.items});
+    }
+}
+
+fn setupMessageHandler(allocator: std.mem.Allocator, bot_token: []const u8, polling_offset: i64) !void {
+    var polling_offset_mutable: i64 = polling_offset;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    while (true) {
+        const polling_updates = try getUpdates(arena_allocator, bot_token, polling_offset_mutable);
+        defer arena_allocator.free(polling_updates);
+
+        for (polling_updates) |polling_update| {
+            try messageHandler(arena_allocator, polling_update);
+
+            if (polling_update.update_id >= polling_offset_mutable) {
+                polling_offset_mutable = polling_update.update_id + 1;
+            }
+        }
+        std.time.sleep(500 * std.time.ns_per_ms);
+    }
+}
+
+fn messageHandler(allocator: std.mem.Allocator, polling_update: TelegramUpdate) !void {
+    if (polling_update.message) |msg| {
+        if (msg.from) |from| {
+            std.debug.print("Message received from {s}\n", .{from.first_name});
+            try callCoreBinary(allocator, msg);
+        }
+    }
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    std.debug.print("Started\n", .{});
+
+    const bot_token = readBotToken(allocator) catch |err| {
         handleTokenError(err);
         return;
     };
+    defer allocator.free(bot_token);
 
-    const polling_offset: i64 = try getPollingOffset(&bot_token);
-    std.debug.print("Polling offset := {}\n", .{polling_offset});
+    const polling_offset = try getPollingOffset(allocator, bot_token);
+    std.debug.print("Polling offset: {}\n", .{polling_offset});
 
-    // while (true) {
-        
-    // }
+    try setupMessageHandler(allocator, bot_token, polling_offset);
 }
