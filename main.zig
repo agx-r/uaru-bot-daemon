@@ -3,15 +3,22 @@ const json = std.json;
 const types = @import("types.zig");
 const telegram = @import("telegram.zig");
 const utils = @import("utils.zig");
+const logger = @import("logger.zig");
 
-fn callCoreBinary(allocator: std.mem.Allocator, message: types.TelegramUpdate.Message) !void {
+fn callCoreBinary(allocator: std.mem.Allocator, message: types.TelegramUpdate.Message, log: *logger.Logger) !void {
     const pwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(pwd);
     const core_path = try std.fs.path.join(allocator, &[_][]const u8{ pwd, "kernel" });
     defer allocator.free(core_path);
 
-    const from = message.from orelse return;
-    const chat = message.chat orelse return;
+    const from = message.from orelse {
+        try log.warn("No 'from' field in message {}", .{message.message_id});
+        return;
+    };
+    const chat = message.chat orelse {
+        try log.warn("No 'chat' field in message {}", .{message.message_id});
+        return;
+    };
     const json_arg = try std.json.stringifyAlloc(allocator, .{
         .event = "messageSent",
         .message = .{
@@ -30,6 +37,7 @@ fn callCoreBinary(allocator: std.mem.Allocator, message: types.TelegramUpdate.Me
     }, .{ .whitespace = .indent_2 });
     defer allocator.free(json_arg);
 
+    try log.debug("Executing core binary with JSON: {s}", .{json_arg});
     var child = std.process.Child.init(&[_][]const u8{ core_path, json_arg }, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
@@ -46,8 +54,7 @@ fn callCoreBinary(allocator: std.mem.Allocator, message: types.TelegramUpdate.Me
 
     const term = try child.wait();
     if (term != .Exited or term.Exited != 0) {
-        const stderr_writer = std.io.getStdErr().writer();
-        try stderr_writer.print("\x1b[31mcore binary failed: {s}\x1b[0m\n", .{stderr.items});
+        try log.err("Core binary failed: {s}", .{stderr.items});
         return error.CoreBinaryFailed;
     }
 
@@ -58,58 +65,67 @@ fn callCoreBinary(allocator: std.mem.Allocator, message: types.TelegramUpdate.Me
 
         const parsed = json.parseFromSlice(types.CoreResponse, arena_allocator, stdout.items, .{}) catch |err| {
             if (err == error.UnexpectedToken) {
+                try log.warn("Unexpected JSON token in core response, ignoring", .{});
                 return;
             }
+            try log.err("Failed to parse core response: {s}", .{@errorName(err)});
             return err;
         };
         defer parsed.deinit();
 
-        if (parsed.value.log) |log| {
-            const stderr_writer = std.io.getStdErr().writer();
-            const color = if (std.mem.eql(u8, log.level, "info"))
-                "\x1b[32m"
-            else if (std.mem.eql(u8, log.level, "debug"))
-                "\x1b[34m"
-            else if (std.mem.eql(u8, log.level, "error"))
-                "\x1b[31m"
+        // Handle log from core response
+        if (parsed.value.log) |core_log| {
+            const level = if (std.mem.eql(u8, core_log.level, "info"))
+                logger.LogLevel.INFO
+            else if (std.mem.eql(u8, core_log.level, "debug"))
+                logger.LogLevel.DEBUG
+            else if (std.mem.eql(u8, core_log.level, "error"))
+                logger.LogLevel.ERROR
             else
-                "\x1b[33m";
-            try stderr_writer.print("{s}{s}\x1b[0m\n", .{color, log.msg});
+                logger.LogLevel.WARN;
+
+            try log.log(level, "Core: {s}", .{core_log.msg});
         }
 
+        // Handle actions
         if (parsed.value.actions) |actions| {
             if (actions.sendMessage) |send_msg| {
-                try telegram.sendMessage(allocator, try utils.readBotToken(allocator), chat.id, send_msg.text, send_msg.replyToId);
+                try telegram.sendMessage(allocator, try utils.readBotToken(allocator, log), chat.id, send_msg.text, send_msg.replyToId, log);
             }
         }
     }
 }
 
-fn setupMessageHandler(allocator: std.mem.Allocator, bot_token: []const u8, polling_offset: i64) !void {
+fn setupMessageHandler(allocator: std.mem.Allocator, bot_token: []const u8, polling_offset: i64, log: *logger.Logger) !void {
     var polling_offset_mutable: i64 = polling_offset;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const arena_allocator = arena.allocator();
 
+    try log.info("Starting message handler with initial offset {}", .{polling_offset});
     while (true) {
-        const polling_updates = try telegram.getUpdates(arena_allocator, bot_token, polling_offset_mutable);
+        const polling_updates = try telegram.getUpdates(arena_allocator, bot_token, polling_offset_mutable, log);
         defer arena_allocator.free(polling_updates);
 
         for (polling_updates) |polling_update| {
-            try messageHandler(arena_allocator, polling_update);
+            try messageHandler(arena_allocator, polling_update, log);
 
             if (polling_update.update_id >= polling_offset_mutable) {
                 polling_offset_mutable = polling_update.update_id + 1;
+                try log.debug("Updated polling offset to {}", .{polling_offset_mutable});
             }
         }
         std.time.sleep(500 * std.time.ns_per_ms);
     }
 }
 
-fn messageHandler(allocator: std.mem.Allocator, polling_update: types.TelegramUpdate) !void {
+fn messageHandler(allocator: std.mem.Allocator, polling_update: types.TelegramUpdate, log: *logger.Logger) !void {
     if (polling_update.message) |msg| {
         if (msg.from) |_| {
-            try callCoreBinary(allocator, msg);
+            try log.info("Processing message {} from chat {}", .{msg.message_id, msg.chat.?.id});
+            try callCoreBinary(allocator, msg, log);
+        } else {
+            try log.warn("Message {} has no sender information", .{msg.message_id});
         }
     }
 }
@@ -119,13 +135,16 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const bot_token = utils.readBotToken(allocator) catch |err| {
-        utils.handleTokenError(err);
+    var log = try logger.Logger.init(allocator, .INFO, "bot.log");
+    defer log.deinit();
+
+    try log.info("Starting Telegram bot", .{});
+    const bot_token = utils.readBotToken(allocator, &log) catch |err| {
+        utils.handleTokenIssue(err, &log);
         return;
     };
     defer allocator.free(bot_token);
 
-    const polling_offset = try telegram.getPollingOffset(allocator, bot_token);
-
-    try setupMessageHandler(allocator, bot_token, polling_offset);
+    const polling_offset = try telegram.getPollingOffset(allocator, bot_token, &log);
+    try setupMessageHandler(allocator, bot_token, polling_offset, &log);
 }
