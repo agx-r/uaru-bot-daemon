@@ -109,7 +109,6 @@ pub const Logger = struct {
         }
     }
 
-
     pub fn debug(self: *Logger, comptime fmt: []const u8, args: anytype) !void {
         try self.log(.DEBUG, fmt, args);
     }
