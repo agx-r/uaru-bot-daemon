@@ -41,7 +41,7 @@ pub const TelegramUpdate = struct {
 pub const CoreResponse = struct {
     status: []const u8,
     log: ?Log = null,
-    actions: Actions,
+    actions: ?Actions = null,
 
     pub const Log = struct {
         msg: []const u8,
@@ -125,7 +125,7 @@ fn parseSingleUpdate(allocator: std.mem.Allocator, update_value: json.Value) !Te
             const chat_obj = chat_val.object;
             const id_val = chat_obj.get("id") orelse return error.InvalidJsonChatId;
             const type_val = chat_obj.get("type") orelse return error.InvalidJsonChatType;
-            if (id_val != .integer or type_val != .string) return error.InvalidJsonType;
+        if (id_val != .integer or type_val != .string) return error.InvalidJsonType;
 
             message.chat = .{
                 .id = id_val.integer,
@@ -202,7 +202,6 @@ fn curlRequest(allocator: std.mem.Allocator, request: []const u8) ![]const u8 {
 
     const term = try child.wait();
     if (term != .Exited or term.Exited != 0) {
-        std.debug.print("curl failed ({}): {s}\n", .{term, stderr.items});
         return error.CurlFailed;
     }
 
@@ -255,12 +254,13 @@ fn readBotToken(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 fn handleTokenError(err: anyerror) void {
+    const stderr = std.io.getStdErr().writer();
     switch (err) {
-        error.FileNotFound => std.debug.print("token.txt not found\n", .{}),
-        error.AccessDenied => std.debug.print("token.txt access denied\n", .{}),
+        error.FileNotFound => stderr.print("\x1b[31mtoken.txt not found\x1b[0m\n", .{}) catch {},
+        error.AccessDenied => stderr.print("\x1b[31mtoken.txt access denied\x1b[0m\n", .{}) catch {},
         error.UnexpectedFileSize, error.InvalidFileSize => 
-            std.debug.print("token.txt invalid file size\n", .{}),
-        else => std.debug.print("Error: {s}\n", .{@errorName(err)}),
+            stderr.print("\x1b[31mtoken.txt invalid file size\x1b[0m\n", .{}) catch {},
+        else => stderr.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)}) catch {},
     }
 }
 
@@ -282,7 +282,8 @@ fn sendMessage(allocator: std.mem.Allocator, bot_token: []const u8, chat_id: i64
 
     const ok = parsed.value.object.get("ok") orelse return error.InvalidTelegramResponse;
     if (!ok.bool) {
-        std.debug.print("Telegram API error: {s}\n", .{response});
+        const stderr = std.io.getStdErr().writer();
+        try stderr.print("\x1b[31mTelegram API error: {s}\x1b[0m\n", .{response});
         return error.TelegramApiError;
     }
 }
@@ -329,28 +330,44 @@ fn callCoreBinary(allocator: std.mem.Allocator, message: TelegramUpdate.Message)
 
     const term = try child.wait();
     if (term != .Exited or term.Exited != 0) {
-        std.debug.print("core binary failed ({}): {s}\n", .{term, stderr.items});
+        const stderr_writer = std.io.getStdErr().writer();
+        try stderr_writer.print("\x1b[31mcore binary failed: {s}\x1b[0m\n", .{stderr.items});
         return error.CoreBinaryFailed;
     }
 
     if (stdout.items.len > 0) {
-        std.debug.print("Core binary output: {s}\n", .{stdout.items});
-
-        // Parse core binary output
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const arena_allocator = arena.allocator();
 
-        const parsed = try json.parseFromSlice(CoreResponse, arena_allocator, stdout.items, .{});
+        const parsed = json.parseFromSlice(CoreResponse, arena_allocator, stdout.items, .{}) catch |err| {
+            if (err == error.UnexpectedToken) {
+                return; // Treat UnexpectedToken as non-error (feature)
+            }
+            return err;
+        };
         defer parsed.deinit();
 
-        // Handle actions
-        if (parsed.value.actions.sendMessage) |send_msg| {
-            try sendMessage(allocator, try readBotToken(allocator), chat.id, send_msg.text, send_msg.replyToId);
+        // Print log with color based on level
+        if (parsed.value.log) |log| {
+            const stderr_writer = std.io.getStdErr().writer();
+            const color = if (std.mem.eql(u8, log.level, "info"))
+                "\x1b[32m" // Green for info
+            else if (std.mem.eql(u8, log.level, "debug"))
+                "\x1b[34m" // Blue for debug
+            else if (std.mem.eql(u8, log.level, "error"))
+                "\x1b[31m" // Red for error
+            else
+                "\x1b[33m"; // Yellow for others
+            try stderr_writer.print("{s}{s}\x1b[0m\n", .{color, log.msg});
         }
-    }
-    if (stderr.items.len > 0) {
-        std.debug.print("Core binary stderr: {s}\n", .{stderr.items});
+
+        // Handle actions
+        if (parsed.value.actions) |actions| {
+            if (actions.sendMessage) |send_msg| {
+                try sendMessage(allocator, try readBotToken(allocator), chat.id, send_msg.text, send_msg.replyToId);
+            }
+        }
     }
 }
 
@@ -377,8 +394,7 @@ fn setupMessageHandler(allocator: std.mem.Allocator, bot_token: []const u8, poll
 
 fn messageHandler(allocator: std.mem.Allocator, polling_update: TelegramUpdate) !void {
     if (polling_update.message) |msg| {
-        if (msg.from) |from| {
-            std.debug.print("Message received from {s}\n", .{from.first_name});
+        if (msg.from) |_| {
             try callCoreBinary(allocator, msg);
         }
     }
@@ -389,8 +405,6 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.debug.print("Started\n", .{});
-
     const bot_token = readBotToken(allocator) catch |err| {
         handleTokenError(err);
         return;
@@ -398,7 +412,6 @@ pub fn main() !void {
     defer allocator.free(bot_token);
 
     const polling_offset = try getPollingOffset(allocator, bot_token);
-    std.debug.print("Polling offset: {}\n", .{polling_offset});
 
     try setupMessageHandler(allocator, bot_token, polling_offset);
 }
