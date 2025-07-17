@@ -52,24 +52,63 @@ pub const Logger = struct {
         const time_str = try std.fmt.allocPrint(self.allocator, "{d}", .{timestamp});
         defer self.allocator.free(time_str);
 
-        const msg = try std.fmt.allocPrint(self.allocator, "[{s}] [{s}] {s}\n", .{ time_str, level.toString(), try std.fmt.allocPrint(self.allocator, fmt, args) });
-        defer self.allocator.free(msg);
+        const msg_content = try std.fmt.allocPrint(self.allocator, fmt, args);
+        defer self.allocator.free(msg_content);
 
-        // Write to console
-        const stderr = std.io.getStdErr().writer();
-        const color = switch (level) {
-            .INFO => "\x1b[32m", // Green
-            .DEBUG => "\x1b[34m", // Blue
-            .ERROR => "\x1b[31m", // Red
-            .WARN => "\x1b[33m", // Yellow
+        const level_background = switch (level) {
+            .INFO => "\x1b[30;42m",  // black on green
+            .DEBUG => "\x1b[30;44m", // black on blue
+            .WARN => "\x1b[30;43m",  // black on yellow
+            .ERROR => "\x1b[30;41m", // black on red
         };
-        try stderr.print("{s}{s}\x1b[0m", .{color, msg});
 
-        // Write to file if configured
+        const bracket_color = switch (level) {
+            .INFO => "\x1b[32m",
+            .DEBUG => "\x1b[34m",
+            .WARN => "\x1b[33m",
+            .ERROR => "\x1b[31m",
+        };
+
+        const time_color = "\x1b[90m"; // dim grey
+        const msg_color = "\x1b[37m";  // white
+
+        const level_str = level.toString();
+
+        const colored_level = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}{s} {s}\x1b[0m{s}",
+            .{ bracket_color, level_background, level_str, bracket_color }
+        );
+        defer self.allocator.free(colored_level);
+
+        const line1 = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}[{s}{s}{s}] {s}\n",
+            .{ time_color, bracket_color, time_str, time_color, colored_level }
+        );
+        defer self.allocator.free(line1);
+
+        const line2 = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}╰ {s}{s}\x1b[0m\n\n",
+            .{ bracket_color, msg_color, msg_content }
+        );
+        defer self.allocator.free(line2);
+
+        const stderr = std.io.getStdErr().writer();
+        try stderr.print("{s}{s}", .{ line1, line2 });
+
         if (self.file) |f| {
-            try f.writeAll(msg);
+            const plain_msg = try std.fmt.allocPrint(
+                self.allocator,
+                "[{s}] [{s}] {s}\n",
+                .{ time_str, level_str, msg_content }
+            );
+            defer self.allocator.free(plain_msg);
+            try f.writeAll(plain_msg);
         }
     }
+
 
     pub fn debug(self: *Logger, comptime fmt: []const u8, args: anytype) !void {
         try self.log(.DEBUG, fmt, args);
